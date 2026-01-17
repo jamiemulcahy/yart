@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { Card as CardType } from '../../types/room';
 
 interface CardProps {
@@ -12,6 +12,13 @@ interface CardProps {
 export function Card({ card, isAdmin, onUpdate, onDelete, onPublish }: CardProps): JSX.Element {
   const [isEditing, setIsEditing] = useState(false);
   const [editText, setEditText] = useState(card.text);
+
+  // Sync editText when card.text changes from server (but not while editing)
+  useEffect(() => {
+    if (!isEditing) {
+      setEditText(card.text);
+    }
+  }, [card.text, isEditing]);
 
   // Card is masked if it's unpublished and has no text (admin viewing others' cards)
   const isMasked = !card.isPublished && !card.text;

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { Card as CardType, Column as ColumnType } from '../../types/room';
 import { Card } from '../Card';
 
@@ -33,6 +33,14 @@ export function Column({
   const [editName, setEditName] = useState(column.name);
   const [editDescription, setEditDescription] = useState(column.description);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+
+  // Sync column edit state when column props change (but not while editing)
+  useEffect(() => {
+    if (!isEditingColumn) {
+      setEditName(column.name);
+      setEditDescription(column.description);
+    }
+  }, [column.name, column.description, isEditingColumn]);
 
   const handleAddCard = (): void => {
     if (newCardText.trim()) {

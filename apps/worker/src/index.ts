@@ -1,10 +1,12 @@
 import { Room } from './room';
+import { getCorsOrigin } from './validation';
 
 export { Room };
 
 export interface Env {
   ROOM: DurableObjectNamespace;
   IMAGES: R2Bucket;
+  CORS_ORIGINS?: string; // Comma-separated list of allowed origins, or '*' for all
 }
 
 export default {
@@ -12,12 +14,21 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
+    // CORS configuration - defaults to '*' in development
+    const allowedOrigins = env.CORS_ORIGINS || '*';
+    const requestOrigin = request.headers.get('Origin');
+    const corsOrigin = getCorsOrigin(requestOrigin, allowedOrigins);
+
     // CORS headers
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
+    const corsHeaders: Record<string, string> = {
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type',
     };
+
+    // Only set Access-Control-Allow-Origin if we have a valid origin
+    if (corsOrigin) {
+      corsHeaders['Access-Control-Allow-Origin'] = corsOrigin;
+    }
 
     // Handle CORS preflight
     if (request.method === 'OPTIONS') {

@@ -59,13 +59,49 @@ interface SessionData {
   authorId: string;
 }
 
+import {
+  isValidId,
+  isValidName,
+  isValidPosition,
+  isValidString,
+  isValidText,
+  MAX_TEXT_LENGTH,
+} from './validation';
+
 export class Room extends DurableObject {
   private sql: SqlStorage;
+  private rateLimitMap: Map<string, number[]> = new Map();
+
+  // Rate limit: max 30 actions per minute per user
+  private readonly RATE_LIMIT_MAX = 30;
+  private readonly RATE_LIMIT_WINDOW_MS = 60000;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.initSchema();
+  }
+
+  private isRateLimited(authorId: string): boolean {
+    const now = Date.now();
+    const windowStart = now - this.RATE_LIMIT_WINDOW_MS;
+
+    // Get or create action timestamps for this author
+    let timestamps = this.rateLimitMap.get(authorId) || [];
+
+    // Remove timestamps outside the window
+    timestamps = timestamps.filter((t) => t > windowStart);
+
+    // Check if rate limited
+    if (timestamps.length >= this.RATE_LIMIT_MAX) {
+      return true;
+    }
+
+    // Record this action
+    timestamps.push(now);
+    this.rateLimitMap.set(authorId, timestamps);
+
+    return false;
   }
 
   private getSession(ws: WebSocket): SessionData | null {
@@ -215,6 +251,11 @@ export class Room extends DurableObject {
       }));
   }
 
+  private columnExists(columnId: string): boolean {
+    const result = this.sql.exec(`SELECT 1 FROM columns WHERE id = ? LIMIT 1`, columnId).toArray();
+    return result.length > 0;
+  }
+
   private getCards(isAdmin: boolean, authorId: string): Card[] {
     const rows = this.sql.exec(`SELECT * FROM cards ORDER BY created_at`).toArray();
     return rows
@@ -259,6 +300,11 @@ export class Room extends DurableObject {
     const session = this.getSession(ws);
     if (!session) return;
 
+    // Apply rate limiting
+    if (this.isRateLimited(session.authorId)) {
+      return; // Silently drop rate-limited messages
+    }
+
     try {
       const msg = JSON.parse(message as string) as {
         type: string;
@@ -266,50 +312,86 @@ export class Room extends DurableObject {
       };
 
       switch (msg.type) {
-        case 'card:add':
+        case 'card:add': {
           // Anyone can add cards (they start unpublished)
-          this.addCard(msg.data as { columnId: string; text: string }, session.authorId);
-          break;
-        case 'card:update':
-          if (session.isAdmin) {
-            this.updateCard(msg.data as { id: string; text: string });
+          const { columnId, text } = msg.data;
+          if (isValidId(columnId) && isValidText(text) && this.columnExists(columnId)) {
+            this.addCard({ columnId, text }, session.authorId);
           }
           break;
-        case 'card:delete':
+        }
+        case 'card:update': {
           if (session.isAdmin) {
-            this.deleteCard(msg.data as { id: string });
+            const { id, text } = msg.data;
+            if (isValidId(id) && isValidText(text)) {
+              this.updateCard({ id, text });
+            }
           }
           break;
-        case 'card:publish':
+        }
+        case 'card:delete': {
           if (session.isAdmin) {
-            this.publishCard(msg.data as { id: string });
+            const { id } = msg.data;
+            if (isValidId(id)) {
+              this.deleteCard({ id });
+            }
           }
           break;
-        case 'card:publish-all':
+        }
+        case 'card:publish': {
           if (session.isAdmin) {
-            this.publishAllCards(msg.data as { columnId: string });
+            const { id } = msg.data;
+            if (isValidId(id)) {
+              this.publishCard({ id });
+            }
           }
           break;
-        case 'column:add':
+        }
+        case 'card:publish-all': {
           if (session.isAdmin) {
-            this.addColumn(msg.data as { name: string; description: string });
+            const { columnId } = msg.data;
+            if (isValidId(columnId)) {
+              this.publishAllCards({ columnId });
+            }
           }
           break;
-        case 'column:update':
+        }
+        case 'column:add': {
           if (session.isAdmin) {
-            this.updateColumn(msg.data as { id: string; name: string; description: string });
+            const { name, description } = msg.data;
+            if (isValidName(name) && isValidString(description)) {
+              this.addColumn({ name, description: description.slice(0, MAX_TEXT_LENGTH) });
+            }
           }
           break;
-        case 'column:delete':
+        }
+        case 'column:update': {
           if (session.isAdmin) {
-            this.deleteColumn(msg.data as { id: string });
+            const { id, name, description } = msg.data;
+            if (isValidId(id) && isValidName(name) && isValidString(description)) {
+              this.updateColumn({ id, name, description: description.slice(0, MAX_TEXT_LENGTH) });
+            }
           }
           break;
-        case 'column:reorder':
+        }
+        case 'column:delete': {
           if (session.isAdmin) {
-            this.reorderColumn(msg.data as { id: string; newPosition: number });
+            const { id } = msg.data;
+            if (isValidId(id)) {
+              this.deleteColumn({ id });
+            }
           }
           break;
+        }
+        case 'column:reorder': {
+          if (session.isAdmin) {
+            const { id, newPosition } = msg.data;
+            if (isValidId(id) && isValidPosition(newPosition)) {
+              this.reorderColumn({ id, newPosition });
+            }
+          }
+          break;
+        }
       }
 
       this.broadcastState();

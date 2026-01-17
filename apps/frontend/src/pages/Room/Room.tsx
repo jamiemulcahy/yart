@@ -52,9 +52,28 @@ export function Room(): JSX.Element {
   const [copied, setCopied] = useState(false);
 
   const handleShare = async (): Promise<void> => {
-    await navigator.clipboard.writeText(window.location.href);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    try {
+      await navigator.clipboard.writeText(window.location.href);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Fallback for browsers without clipboard API or when permission denied
+      const textArea = document.createElement('textarea');
+      textArea.value = window.location.href;
+      textArea.style.position = 'fixed';
+      textArea.style.opacity = '0';
+      document.body.appendChild(textArea);
+      textArea.select();
+      try {
+        document.execCommand('copy');
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      } catch {
+        // If all else fails, prompt user to copy manually
+        window.prompt('Copy this link:', window.location.href);
+      }
+      document.body.removeChild(textArea);
+    }
   };
 
   if (!roomId) {

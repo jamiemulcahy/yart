@@ -39,7 +39,16 @@ export function useRoom({ roomId, token }: UseRoomOptions): UseRoomResult {
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
+  const reconnectAttemptRef = useRef(0);
   const isCleaningUpRef = useRef(false);
+
+  // Exponential backoff: 1s, 2s, 4s, 8s, max 30s
+  const getReconnectDelay = (): number => {
+    const baseDelay = 1000;
+    const maxDelay = 30000;
+    const delay = Math.min(baseDelay * Math.pow(2, reconnectAttemptRef.current), maxDelay);
+    return delay;
+  };
 
   const connect = useCallback((): void => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -69,6 +78,7 @@ export function useRoom({ roomId, token }: UseRoomOptions): UseRoomResult {
         return;
       }
       setStatus('connected');
+      reconnectAttemptRef.current = 0; // Reset backoff on successful connection
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
         reconnectTimeoutRef.current = null;
@@ -102,10 +112,12 @@ export function useRoom({ roomId, token }: UseRoomOptions): UseRoomResult {
       }
       setStatus('disconnected');
       wsRef.current = null;
-      // Attempt reconnect after 2 seconds
+      // Attempt reconnect with exponential backoff
+      const delay = getReconnectDelay();
+      reconnectAttemptRef.current += 1;
       reconnectTimeoutRef.current = window.setTimeout(() => {
         connect();
-      }, 2000);
+      }, delay);
     };
 
     ws.onerror = (): void => {
