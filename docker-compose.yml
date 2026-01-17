@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: .devcontainer/Dockerfile
+    volumes:
+      - .:/workspace:cached
+      - node_modules:/workspace/node_modules
+      - pnpm_store:/home/node/.local/share/pnpm/store
+    ports:
+      - '5173:5173'
+      - '8787:8787'
+    command: sleep infinity
+    environment:
+      - NODE_ENV=development
+
+volumes:
+  node_modules:
+  pnpm_store:
