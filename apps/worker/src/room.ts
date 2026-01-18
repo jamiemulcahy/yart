@@ -12,6 +12,13 @@ interface RoomMeta {
   createdAt: string;
 }
 
+// Public meta excludes admin token for client-side state
+interface PublicRoomMeta {
+  id: string;
+  template: string;
+  createdAt: string;
+}
+
 interface Column {
   id: string;
   name: string;
@@ -47,14 +54,66 @@ const TEMPLATES: Record<string, Array<{ name: string; description: string }>> = 
   blank: [],
 };
 
+interface SessionData {
+  isAdmin: boolean;
+  authorId: string;
+}
+
+import {
+  isValidId,
+  isValidName,
+  isValidPosition,
+  isValidString,
+  isValidText,
+  MAX_TEXT_LENGTH,
+} from './validation';
+
 export class Room extends DurableObject {
   private sql: SqlStorage;
-  private sessions: Map<WebSocket, { isAdmin: boolean; authorId: string }> = new Map();
+  private rateLimitMap: Map<string, number[]> = new Map();
+
+  // Rate limit: max 30 actions per minute per user
+  private readonly RATE_LIMIT_MAX = 30;
+  private readonly RATE_LIMIT_WINDOW_MS = 60000;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.initSchema();
+  }
+
+  private isRateLimited(authorId: string): boolean {
+    const now = Date.now();
+    const windowStart = now - this.RATE_LIMIT_WINDOW_MS;
+
+    // Get or create action timestamps for this author
+    let timestamps = this.rateLimitMap.get(authorId) || [];
+
+    // Remove timestamps outside the window
+    timestamps = timestamps.filter((t) => t > windowStart);
+
+    // Check if rate limited
+    if (timestamps.length >= this.RATE_LIMIT_MAX) {
+      return true;
+    }
+
+    // Record this action
+    timestamps.push(now);
+    this.rateLimitMap.set(authorId, timestamps);
+
+    return false;
+  }
+
+  private getSession(ws: WebSocket): SessionData | null {
+    try {
+      const attachment = ws.deserializeAttachment();
+      if (attachment && typeof attachment === 'object') {
+        return attachment as SessionData;
+      }
+    } catch {
+      // No attachment
+    }
+    return null;
   }
 
   private initSchema(): void {
@@ -134,7 +193,8 @@ export class Room extends DurableObject {
       const isAdmin = token === meta?.adminToken;
       const authorId = crypto.randomUUID();
 
-      this.sessions.set(server, { isAdmin, authorId });
+      // Store session data as WebSocket attachment (survives hibernation)
+      server.serializeAttachment({ isAdmin, authorId });
 
       this.ctx.acceptWebSocket(server);
 
@@ -168,6 +228,17 @@ export class Room extends DurableObject {
     };
   }
 
+  // Returns meta without admin token for sending to clients
+  private getPublicMeta(): PublicRoomMeta | null {
+    const meta = this.getRoomMeta();
+    if (!meta) return null;
+    return {
+      id: meta.id,
+      template: meta.template,
+      createdAt: meta.createdAt,
+    };
+  }
+
   private getColumns(): Column[] {
     return this.sql
       .exec(`SELECT * FROM columns ORDER BY position`)
@@ -180,31 +251,45 @@ export class Room extends DurableObject {
       }));
   }
 
+  private columnExists(columnId: string): boolean {
+    const result = this.sql.exec(`SELECT 1 FROM columns WHERE id = ? LIMIT 1`, columnId).toArray();
+    return result.length > 0;
+  }
+
   private getCards(isAdmin: boolean, authorId: string): Card[] {
     const rows = this.sql.exec(`SELECT * FROM cards ORDER BY created_at`).toArray();
     return rows
       .filter((row) => {
+        // Published cards are visible to everyone
         if (row.is_published) return true;
+        // Unpublished cards: admin sees them (to know count) but author sees their own
         if (isAdmin) return true;
         if (row.author_id === authorId) return true;
         return false;
       })
-      .map((row) => ({
-        id: row.id as string,
-        columnId: row.column_id as string,
-        text: row.text as string,
-        authorId: row.author_id as string,
-        isPublished: Boolean(row.is_published),
-        createdAt: row.created_at as string,
-      }));
+      .map((row) => {
+        const isOwnCard = row.author_id === authorId;
+        const isPublished = Boolean(row.is_published);
+        // Mask text for unpublished cards that aren't owned by the viewer
+        // Admin can see there ARE cards but not read content until published
+        const shouldMaskText = !isPublished && !isOwnCard;
+        return {
+          id: row.id as string,
+          columnId: row.column_id as string,
+          text: shouldMaskText ? '' : (row.text as string),
+          authorId: row.author_id as string,
+          isPublished,
+          createdAt: row.created_at as string,
+        };
+      });
   }
 
   private getState(
     isAdmin: boolean,
     authorId: string
-  ): { meta: RoomMeta | null; columns: Column[]; cards: Card[]; isAdmin: boolean } {
+  ): { meta: PublicRoomMeta | null; columns: Column[]; cards: Card[]; isAdmin: boolean } {
     return {
-      meta: this.getRoomMeta(),
+      meta: this.getPublicMeta(),
       columns: this.getColumns(),
       cards: this.getCards(isAdmin, authorId),
       isAdmin,
@@ -212,8 +297,13 @@ export class Room extends DurableObject {
   }
 
   webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
-    const session = this.sessions.get(ws);
+    const session = this.getSession(ws);
     if (!session) return;
+
+    // Apply rate limiting
+    if (this.isRateLimited(session.authorId)) {
+      return; // Silently drop rate-limited messages
+    }
 
     try {
       const msg = JSON.parse(message as string) as {
@@ -222,31 +312,86 @@ export class Room extends DurableObject {
       };
 
       switch (msg.type) {
-        case 'card:add':
-          if (session.isAdmin) {
-            this.addCard(msg.data as { columnId: string; text: string }, session.authorId);
+        case 'card:add': {
+          // Anyone can add cards (they start unpublished)
+          const { columnId, text } = msg.data;
+          if (isValidId(columnId) && isValidText(text) && this.columnExists(columnId)) {
+            this.addCard({ columnId, text }, session.authorId);
           }
           break;
-        case 'card:update':
+        }
+        case 'card:update': {
           if (session.isAdmin) {
-            this.updateCard(msg.data as { id: string; text: string });
+            const { id, text } = msg.data;
+            if (isValidId(id) && isValidText(text)) {
+              this.updateCard({ id, text });
+            }
           }
           break;
-        case 'card:delete':
+        }
+        case 'card:delete': {
           if (session.isAdmin) {
-            this.deleteCard(msg.data as { id: string });
+            const { id } = msg.data;
+            if (isValidId(id)) {
+              this.deleteCard({ id });
+            }
           }
           break;
-        case 'card:publish':
+        }
+        case 'card:publish': {
           if (session.isAdmin) {
-            this.publishCard(msg.data as { id: string });
+            const { id } = msg.data;
+            if (isValidId(id)) {
+              this.publishCard({ id });
+            }
           }
           break;
-        case 'card:publish-all':
+        }
+        case 'card:publish-all': {
           if (session.isAdmin) {
-            this.publishAllCards(msg.data as { columnId: string });
+            const { columnId } = msg.data;
+            if (isValidId(columnId)) {
+              this.publishAllCards({ columnId });
+            }
           }
           break;
+        }
+        case 'column:add': {
+          if (session.isAdmin) {
+            const { name, description } = msg.data;
+            if (isValidName(name) && isValidString(description)) {
+              this.addColumn({ name, description: description.slice(0, MAX_TEXT_LENGTH) });
+            }
+          }
+          break;
+        }
+        case 'column:update': {
+          if (session.isAdmin) {
+            const { id, name, description } = msg.data;
+            if (isValidId(id) && isValidName(name) && isValidString(description)) {
+              this.updateColumn({ id, name, description: description.slice(0, MAX_TEXT_LENGTH) });
+            }
+          }
+          break;
+        }
+        case 'column:delete': {
+          if (session.isAdmin) {
+            const { id } = msg.data;
+            if (isValidId(id)) {
+              this.deleteColumn({ id });
+            }
+          }
+          break;
+        }
+        case 'column:reorder': {
+          if (session.isAdmin) {
+            const { id, newPosition } = msg.data;
+            if (isValidId(id) && isValidPosition(newPosition)) {
+              this.reorderColumn({ id, newPosition });
+            }
+          }
+          break;
+        }
       }
 
       this.broadcastState();
@@ -255,12 +400,12 @@ export class Room extends DurableObject {
     }
   }
 
-  webSocketClose(ws: WebSocket): void {
-    this.sessions.delete(ws);
+  webSocketClose(_ws: WebSocket): void {
+    // Session data is automatically cleaned up with the WebSocket
   }
 
-  webSocketError(ws: WebSocket): void {
-    this.sessions.delete(ws);
+  webSocketError(_ws: WebSocket): void {
+    // Session data is automatically cleaned up with the WebSocket
   }
 
   private addCard(data: { columnId: string; text: string }, authorId: string): void {
@@ -290,14 +435,77 @@ export class Room extends DurableObject {
     this.sql.exec(`UPDATE cards SET is_published = 1 WHERE column_id = ?`, data.columnId);
   }
 
+  private addColumn(data: { name: string; description: string }): void {
+    // Get max position
+    const result = this.sql.exec(`SELECT MAX(position) as max_pos FROM columns`).toArray();
+    const maxPos = (result[0]?.max_pos as number | null) ?? -1;
+
+    this.sql.exec(
+      `INSERT INTO columns (id, name, description, position) VALUES (?, ?, ?, ?)`,
+      crypto.randomUUID(),
+      data.name,
+      data.description,
+      maxPos + 1
+    );
+  }
+
+  private updateColumn(data: { id: string; name: string; description: string }): void {
+    this.sql.exec(
+      `UPDATE columns SET name = ?, description = ? WHERE id = ?`,
+      data.name,
+      data.description,
+      data.id
+    );
+  }
+
+  private deleteColumn(data: { id: string }): void {
+    // Delete all cards in the column first
+    this.sql.exec(`DELETE FROM cards WHERE column_id = ?`, data.id);
+    // Delete the column
+    this.sql.exec(`DELETE FROM columns WHERE id = ?`, data.id);
+  }
+
+  private reorderColumn(data: { id: string; newPosition: number }): void {
+    // Get current position of the column
+    const result = this.sql.exec(`SELECT position FROM columns WHERE id = ?`, data.id).toArray();
+    if (result.length === 0) return;
+
+    const currentPosition = result[0].position as number;
+    const newPosition = data.newPosition;
+
+    if (currentPosition === newPosition) return;
+
+    if (currentPosition < newPosition) {
+      // Moving down: shift columns between current+1 and new position up by 1
+      this.sql.exec(
+        `UPDATE columns SET position = position - 1 WHERE position > ? AND position <= ?`,
+        currentPosition,
+        newPosition
+      );
+    } else {
+      // Moving up: shift columns between new position and current-1 down by 1
+      this.sql.exec(
+        `UPDATE columns SET position = position + 1 WHERE position >= ? AND position < ?`,
+        newPosition,
+        currentPosition
+      );
+    }
+
+    // Set the new position for the moved column
+    this.sql.exec(`UPDATE columns SET position = ? WHERE id = ?`, newPosition, data.id);
+  }
+
   private broadcastState(): void {
-    for (const [ws, session] of this.sessions) {
+    const webSockets = this.ctx.getWebSockets();
+    for (const ws of webSockets) {
       try {
-        const state = this.getState(session.isAdmin, session.authorId);
-        ws.send(JSON.stringify({ type: 'sync', data: state }));
+        const session = this.getSession(ws);
+        if (session) {
+          const state = this.getState(session.isAdmin, session.authorId);
+          ws.send(JSON.stringify({ type: 'sync', data: state }));
+        }
       } catch {
-        // Remove dead connections
-        this.sessions.delete(ws);
+        // Ignore dead connections - they'll be cleaned up automatically
       }
     }
   }
